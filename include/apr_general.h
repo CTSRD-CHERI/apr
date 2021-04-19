@@ -140,7 +140,11 @@ int strncasecmp(const char *a, const char *b, size_t n);
     (((size) + ((boundary) - 1)) & ~((boundary) - 1))
 
 /** Default alignment */
+#if APR_SIZEOF_VOIDP > 8
+#define APR_ALIGN_DEFAULT(size) APR_ALIGN(size, APR_SIZEOF_VOIDP)
+#else
 #define APR_ALIGN_DEFAULT(size) APR_ALIGN(size, 8)
+#endif
 
 
 /**
