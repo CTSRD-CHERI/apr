@@ -399,9 +399,12 @@ typedef  @ino_t_value@           apr_ino_t;
 #if APR_SIZEOF_VOIDP == 8
 typedef  apr_uint64_t            apr_uintptr_t;
 typedef  apr_int64_t             apr_intptr_t;
-#else
+#elif APR_SIZEOF_VOIDP == 4
 typedef  apr_uint32_t            apr_uintptr_t;
 typedef  apr_int32_t             apr_intptr_t;
+#else
+typedef  uintptr_t               apr_uintptr_t;
+typedef  intptr_t                apr_intptr_t;
 #endif
 
 /* Are we big endian? */
