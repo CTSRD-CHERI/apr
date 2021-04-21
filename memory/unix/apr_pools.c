@@ -32,6 +32,10 @@
 #include "apr_want.h"
 #include "apr_env.h"
 
+#ifdef __CHERI_PURE_CAPABILITY__
+#include <assert.h>
+#endif
+
 #if APR_HAVE_STDLIB_H
 #include <stdlib.h>     /* for malloc, free and abort */
 #endif
@@ -259,6 +263,9 @@ apr_size_t allocator_align(apr_size_t in_size)
      * allocate at least a certain size (MIN_ALLOC).
      */
     size = APR_ALIGN(size + APR_MEMNODE_T_SIZE, BOUNDARY_SIZE);
+#ifdef __CHERI_PURE_CAPABILITY__
+    size = __builtin_cheri_round_representable_length(size);
+#endif
     if (size < in_size) {
         return 0;
     }
@@ -755,6 +762,11 @@ APR_DECLARE(void) apr_pool_terminate(void)
 } while (0)
 
 /* Returns the amount of free space in the given node. */
+#ifdef __CHERI_PURE_CAPABILITY__
+#define node_free_aligned_space(node_, first_avail_) \
+    ((apr_size_t)(first_avail_ > node_->endp ?  \
+        0 : node_->endp - first_avail_))
+#endif
 #define node_free_space(node_) ((apr_size_t)(node_->endp - node_->first_avail))
 
 /*
@@ -828,12 +840,20 @@ APR_DECLARE(void *) apr_palloc(apr_pool_t *pool, apr_size_t in_size)
     apr_memnode_t *active, *node;
     void *mem;
     apr_size_t size, free_index;
+#ifdef __CHERI_PURE_CAPABILITY__
+    apr_size_t cheri_align;
+    char *first_avail;
+#endif
 
     pool_concurrency_set_used(pool);
     size = APR_ALIGN_DEFAULT(in_size);
 #if HAVE_VALGRIND
     if (apr_running_on_valgrind)
         size += 2 * REDZONE;
+#endif
+#ifdef __CHERI_PURE_CAPABILITY__
+    size = __builtin_cheri_round_representable_length(size);
+    cheri_align = ~__builtin_cheri_representable_alignment_mask(size) + 1;
 #endif
     if (size < in_size) {
         pool_concurrency_set_idle(pool);
@@ -845,14 +865,29 @@ APR_DECLARE(void *) apr_palloc(apr_pool_t *pool, apr_size_t in_size)
     active = pool->active;
 
     /* If the active node has enough bytes left, use it. */
+#ifdef __CHERI_PURE_CAPABILITY__
+    first_avail = __builtin_align_up(active->first_avail, cheri_align);
+    if (size <= node_free_aligned_space(active, first_avail)) {
+        mem = __builtin_cheri_bounds_set_exact(first_avail, size);
+        active->first_avail = first_avail + size;
+        assert(active->first_avail <= active->endp);
+        goto have_mem;
+    }
+#else
     if (size <= node_free_space(active)) {
         mem = active->first_avail;
         active->first_avail += size;
         goto have_mem;
     }
+#endif
 
     node = active->next;
+#ifdef __CHERI_PURE_CAPABILITY__
+    first_avail = __builtin_align_up(node->first_avail, cheri_align);
+    if (size <= node_free_aligned_space(node, first_avail)) {
+#else
     if (size <= node_free_space(node)) {
+#endif
         list_remove(node);
     }
     else {
@@ -867,8 +902,15 @@ APR_DECLARE(void *) apr_palloc(apr_pool_t *pool, apr_size_t in_size)
 
     node->free_index = 0;
 
+#ifdef __CHERI_PURE_CAPABILITY__
+    first_avail = __builtin_align_up(node->first_avail, cheri_align);
+    mem = __builtin_cheri_bounds_set_exact(first_avail, size);
+    node->first_avail = first_avail + size;
+    assert(node->first_avail <= node->endp);
+#else
     mem = node->first_avail;
     node->first_avail += size;
+#endif
 
     list_insert(node, active);
 
@@ -1348,6 +1390,10 @@ APR_DECLARE(char *) apr_pvsprintf(apr_pool_t *pool, const char *fmt, va_list ap)
     apr_size_t size;
     apr_memnode_t *active, *node;
     apr_size_t free_index;
+#ifdef __CHERI_PURE_CAPABILITY__
+    apr_size_t rounded_len, cheri_align;
+    char *strp_aligned;
+#endif
 
     pool_concurrency_set_used(pool);
     ps.node = pool->active;
@@ -1383,6 +1429,35 @@ APR_DECLARE(char *) apr_pvsprintf(apr_pool_t *pool, const char *fmt, va_list ap)
 
     *ps.vbuff.curpos++ = '\0';
 
+#ifdef __CHERI_PURE_CAPABILITY__
+    size = ps.vbuff.curpos - ps.node->first_avail;
+    strp = ps.node->first_avail;
+
+    rounded_len = __builtin_cheri_round_representable_length(
+        APR_ALIGN_DEFAULT(size));
+    cheri_align = ~__builtin_cheri_representable_alignment_mask(rounded_len)
+        + 1;
+    strp_aligned = __builtin_align_up(strp, cheri_align);
+    if (rounded_len <= node_free_aligned_space(ps.node, strp_aligned)) {
+        if ((node = allocator_alloc(pool->allocator, rounded_len)) == NULL)
+            goto error;
+
+        if (ps.got_a_new_node) {
+            ps.node->next = ps.free;
+            ps.free = ps.node;
+        }
+
+        ps.got_a_new_node = 1;
+        ps.node = node;
+
+        strp_aligned = __builtin_align_up(node->first_avail, cheri_align);
+    }
+    if (strp != strp_aligned)
+        memmove(strp_aligned, strp, size);
+    strp = __builtin_cheri_bounds_set_exact(strp_aligned, rounded_len);
+    ps.node->first_avail = strp_aligned + rounded_len;
+    assert(ps.node->first_avail <= ps.node->endp);
+#else
 #if HAVE_VALGRIND
     if (!apr_running_on_valgrind) {
         strp = ps.node->first_avail;
@@ -1405,6 +1480,7 @@ APR_DECLARE(char *) apr_pvsprintf(apr_pool_t *pool, const char *fmt, va_list ap)
     size = ps.vbuff.curpos - ps.node->first_avail;
     size = APR_ALIGN_DEFAULT(size);
     ps.node->first_avail += size;
+#endif
 
     if (ps.free)
         allocator_free(pool->allocator, ps.free);
